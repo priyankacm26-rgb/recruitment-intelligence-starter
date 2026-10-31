@@ -1,8 +1,7 @@
 
 import base64
-import os
-from email.utils import parseaddr
 from pathlib import Path
+from email.utils import parseaddr
 
 from fastapi import FastAPI, HTTPException, UploadFile, File
 from fastapi.middleware.cors import CORSMiddleware
@@ -14,6 +13,7 @@ from .resume_service import save_resume
 
 
 app = FastAPI(title="Recruitment Intelligence API")
+
 
 app.add_middleware(
     CORSMiddleware,
@@ -228,8 +228,7 @@ def email_logs(limit: int = 100):
 
 
 # --------------------------------------------------
-# Existing Gmail polling endpoint
-# Do not run until the legacy poll service is reviewed.
+# Gmail polling
 # --------------------------------------------------
 
 @app.post("/email/gmail/poll")
@@ -247,7 +246,7 @@ def gmail_poll():
 
 
 # --------------------------------------------------
-# Gmail preview - must not write to the database
+# Gmail preview - read-only
 # --------------------------------------------------
 
 @app.post("/email/gmail/preview")
@@ -265,7 +264,7 @@ def gmail_preview():
 
 
 # --------------------------------------------------
-# Gmail approved import
+# Gmail attachment helper
 # --------------------------------------------------
 
 def collect_attachment_parts(part):
@@ -281,9 +280,202 @@ def collect_attachment_parts(part):
     return found
 
 
+# --------------------------------------------------
+# Gmail synchronization
+# --------------------------------------------------
+
+@app.post("/email/gmail/sync")
+def sync_gmail_endpoint():
+    try:
+        from .gmail_inbox_service import sync_gmail_inbox
+
+        return sync_gmail_inbox()
+
+    except Exception as exc:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Gmail synchronization failed: {str(exc)[:400]}",
+        )
+
+
+# --------------------------------------------------
+# Gmail inbox - retrieve synchronized messages
+# --------------------------------------------------
+
+@app.get("/email/gmail/messages")
+def get_gmail_messages(
+    folder: str = "all",
+    search: str = "",
+    limit: int = 100,
+    offset: int = 0,
+):
+    folder = folder.lower().strip()
+
+    if folder not in ("all", "received", "sent"):
+        raise HTTPException(
+            status_code=400,
+            detail="folder must be all, received, or sent",
+        )
+
+    limit = max(1, min(limit, 200))
+    offset = max(0, offset)
+
+    conditions = []
+    params = []
+
+    if folder == "received":
+        conditions.append("is_received = 1")
+
+    elif folder == "sent":
+        conditions.append("is_sent = 1")
+
+    if search.strip():
+        conditions.append(
+            """
+            (
+                subject LIKE %s
+                OR sender_email LIKE %s
+                OR sender_name LIKE %s
+                OR recipients LIKE %s
+            )
+            """
+        )
+
+        search_value = f"%{search.strip()}%"
+        params.extend([
+            search_value,
+            search_value,
+            search_value,
+            search_value,
+        ])
+
+    where_clause = (
+        "WHERE " + " AND ".join(conditions)
+        if conditions
+        else ""
+    )
+
+    conn = connect()
+
+    try:
+        cur = conn.cursor(dictionary=True)
+
+        # Count matching emails.
+        cur.execute(
+            f"""
+            SELECT COUNT(*) AS total
+            FROM gmail_messages
+            {where_clause}
+            """,
+            tuple(params),
+        )
+
+        total = cur.fetchone()["total"]
+
+        # Retrieve matching emails.
+        cur.execute(
+            f"""
+            SELECT
+                id,
+                gmail_message_id,
+                thread_id,
+                sender_name,
+                sender_email,
+                recipients,
+                subject,
+                snippet,
+                received_at,
+                is_received,
+                is_sent,
+                has_attachments,
+                attachment_count,
+                labels,
+                sync_status
+            FROM gmail_messages
+            {where_clause}
+            ORDER BY received_at DESC, id DESC
+            LIMIT %s OFFSET %s
+            """,
+            tuple(params + [limit, offset]),
+        )
+
+        messages = cur.fetchall()
+
+        # Retrieve attachments for the displayed emails.
+        message_ids = [
+            message["id"]
+            for message in messages
+        ]
+
+        if message_ids:
+            placeholders = ",".join(
+                ["%s"] * len(message_ids)
+            )
+
+            cur.execute(
+                f"""
+                SELECT
+                    gmail_message_pk,
+                    attachment_key,
+                    gmail_attachment_id,
+                    filename,
+                    mime_type,
+                    size_bytes,
+                    is_resume,
+                    candidate_id,
+                    processing_status
+                FROM gmail_attachments
+                WHERE gmail_message_pk IN ({placeholders})
+                ORDER BY id ASC
+                """,
+                tuple(message_ids),
+            )
+
+            attachments = cur.fetchall()
+
+            attachment_map = {}
+
+            for attachment in attachments:
+                message_pk = attachment["gmail_message_pk"]
+
+                attachment_map.setdefault(
+                    message_pk, []
+                ).append(attachment)
+
+            for message in messages:
+                message["attachments"] = attachment_map.get(
+                    message["id"], []
+                )
+
+        else:
+            for message in messages:
+                message["attachments"] = []
+
+        return {
+            "total": total,
+            "limit": limit,
+            "offset": offset,
+            "folder": folder,
+            "messages": messages,
+        }
+
+    except Exception as exc:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Could not retrieve Gmail messages: {str(exc)[:300]}",
+        )
+
+    finally:
+        conn.close()
+
+
+# --------------------------------------------------
+# Gmail approved resume import
+# --------------------------------------------------
+
 @app.post("/email/gmail/import-approved")
 def gmail_import_approved(req: GmailImportRequest):
-    # Require explicit approval.
+
     if req.approved is not True:
         raise HTTPException(
             status_code=400,
@@ -291,60 +483,12 @@ def gmail_import_approved(req: GmailImportRequest):
         )
 
     try:
-        from google.oauth2.credentials import Credentials
-        from google.auth.transport.requests import Request
-        from googleapiclient.discovery import build
-
+        from .gmail_service import service
         from .gmail_review_service import import_approved_resume
 
-        # Find the Gmail token file.
-        token_path = Path(
-            os.getenv("GMAIL_TOKEN_FILE", "token.json")
-        )
+        gmail = service()
 
-        if not token_path.is_absolute():
-            token_path = Path.cwd() / token_path
-
-        if not token_path.is_file():
-            raise HTTPException(
-                status_code=500,
-                detail=(
-                    "Gmail token file was not found. "
-                    "Check GMAIL_TOKEN_FILE and your project directory."
-                ),
-            )
-
-        # Use read-only Gmail access.
-        scopes = [
-            "https://www.googleapis.com/auth/gmail.readonly"
-        ]
-
-        credentials = Credentials.from_authorized_user_file(
-            str(token_path),
-            scopes,
-        )
-
-        if credentials.expired and credentials.refresh_token:
-            credentials.refresh(Request())
-            token_path.write_text(
-                credentials.to_json(),
-                encoding="utf-8",
-            )
-
-        if not credentials.valid:
-            raise HTTPException(
-                status_code=500,
-                detail="Gmail credentials are invalid. Reauthorize Gmail.",
-            )
-
-        gmail = build(
-            "gmail",
-            "v1",
-            credentials=credentials,
-            cache_discovery=False,
-        )
-
-        # Retrieve the selected Gmail message.
+        # Retrieve selected Gmail message.
         message = (
             gmail.users()
             .messages()
@@ -366,7 +510,7 @@ def gmail_import_approved(req: GmailImportRequest):
         sender = parseaddr(headers.get("from", ""))[1]
         subject = headers.get("subject", "")
 
-        # Match the requested attachment to this message.
+        # Validate filename.
         requested_filename = Path(req.filename).name
 
         if requested_filename != req.filename:
@@ -375,6 +519,7 @@ def gmail_import_approved(req: GmailImportRequest):
                 detail="Invalid attachment filename.",
             )
 
+        # Find selected attachment.
         matching_part = next(
             (
                 part
@@ -387,18 +532,25 @@ def gmail_import_approved(req: GmailImportRequest):
         if matching_part is None:
             raise HTTPException(
                 status_code=404,
-                detail=(
-                    "The specified attachment was not found "
-                    "in the selected Gmail message."
-                ),
+                detail="Selected attachment was not found.",
+            )
+
+        # Only PDF and DOCX resumes are supported.
+        if Path(requested_filename).suffix.lower() not in (
+            ".pdf",
+            ".docx",
+        ):
+            raise HTTPException(
+                status_code=400,
+                detail="Only PDF and DOCX resumes can be imported.",
             )
 
         body = matching_part.get("body", {})
         encoded_data = body.get("data", "")
 
-        # Gmail often stores attachment bytes separately.
         attachment_id = body.get("attachmentId")
 
+        # Download Gmail attachment if stored separately.
         if attachment_id:
             attachment = (
                 gmail.users()
@@ -417,10 +569,10 @@ def gmail_import_approved(req: GmailImportRequest):
         if not encoded_data:
             raise HTTPException(
                 status_code=400,
-                detail="The selected attachment contains no data.",
+                detail="Selected attachment contains no data.",
             )
 
-        # Decode Gmail's URL-safe Base64 attachment data.
+        # Decode URL-safe Base64 data.
         encoded_data += "=" * (-len(encoded_data) % 4)
 
         try:
@@ -429,20 +581,20 @@ def gmail_import_approved(req: GmailImportRequest):
                 altchars=b"-_",
                 validate=True,
             )
+
         except Exception:
             raise HTTPException(
                 status_code=400,
-                detail="Could not decode the Gmail attachment.",
+                detail="Could not decode Gmail attachment.",
             )
 
         if not raw_attachment:
             raise HTTPException(
                 status_code=400,
-                detail="The selected attachment is empty.",
+                detail="Selected attachment is empty.",
             )
 
-        # The service must validate the file, check duplicates,
-        # and write candidate + ingestion log transactionally.
+        # Import service handles validation and duplicate checking.
         return import_approved_resume(
             message_id=req.message_id,
             filename=requested_filename,
