@@ -5,52 +5,8 @@ from pathlib import Path
 from email.utils import parseaddr
 from datetime import datetime, timezone
 
-from dotenv import load_dotenv
-from google.oauth2.credentials import Credentials
-from google.auth.transport.requests import Request
-from googleapiclient.discovery import build
-
+from .gmail_service import service as get_gmail_service
 from .resume_preview import preview_resume
-
-load_dotenv()
-
-SCOPES = ["https://www.googleapis.com/auth/gmail.readonly"]
-
-
-def get_gmail_service():
-    """Create an authenticated Gmail API client."""
-
-    token_path = Path(os.getenv("GMAIL_TOKEN_FILE", "token.json"))
-
-    if not token_path.is_absolute():
-        token_path = Path.cwd() / token_path
-
-    if not token_path.is_file():
-        raise RuntimeError(
-            f"Gmail token file not found: {token_path}. "
-            "Complete Gmail authorization first."
-        )
-
-    creds = Credentials.from_authorized_user_file(
-        str(token_path),
-        SCOPES,
-    )
-
-    if creds.expired and creds.refresh_token:
-        creds.refresh(Request())
-        token_path.write_text(creds.to_json(), encoding="utf-8")
-
-    if not creds.valid:
-        raise RuntimeError(
-            "Gmail authorization is invalid. Please authorize Gmail again."
-        )
-
-    return build(
-        "gmail",
-        "v1",
-        credentials=creds,
-        cache_discovery=False,
-    )
 
 
 def decode_attachment(encoded_data):
@@ -102,10 +58,9 @@ def get_received_date(message):
 
 def preview_gmail():
     """
-    Preview Gmail inbox messages and supported resume attachments.
+    Preview Gmail messages and supported resume attachments.
 
-    This function does not call save_resume().
-    It does not insert, update, or delete candidate records.
+    This function does not insert, update, or delete candidate records.
     """
 
     api = get_gmail_service()
@@ -115,14 +70,15 @@ def preview_gmail():
         "in:anywhere -in:spam -in:trash",
     )
 
-    max_messages = int(os.getenv("GMAIL_PREVIEW_MAX_MESSAGES", "100"))
+    max_messages = int(
+        os.getenv("GMAIL_PREVIEW_MAX_MESSAGES", "100")
+    )
 
     messages = []
     page_token = None
 
     print("GMAIL QUERY:", query)
 
-    # Retrieve messages using pagination.
     while len(messages) < max_messages:
 
         page_size = min(100, max_messages - len(messages))
@@ -205,7 +161,6 @@ def preview_gmail():
                 "database_changed": False,
             }
 
-            # Preview only supported PDF and DOCX attachments.
             for part in parts:
 
                 filename = Path(part["filename"]).name
